@@ -1,15 +1,10 @@
-import tensorflow as tf
-import numpy as np
-
-
-# tf.enable_eager_execution()
-
-from typing import NamedTuple, Type
-from networks import get_weight
-from typing import List, Tuple, Iterable
+from typing import NamedTuple, Type, List, Tuple, Iterable
 from functools import wraps
 
-DATA_FORMAT = "channels_first"
+import numpy as np
+import tensorflow as tf
+# tf.enable_eager_execution()
+
 
 
 class HeInitializer(tf.keras.initializers.VarianceScaling):
@@ -82,7 +77,6 @@ class WeightScaledDense(WeightScaled(tf.keras.layers.Dense)):
         *args, **kwargs):
         super().__init__(units=units, activation=activation, use_bias=use_bias, *args, **kwargs)
 
-
 class WeightScaledConv2D(WeightScaled(tf.keras.layers.Conv2D)):
     def __init__(self,
                  filters: int,
@@ -95,7 +89,6 @@ class WeightScaledConv2D(WeightScaled(tf.keras.layers.Conv2D)):
         super().__init__(
             filters=filters, kernel_size=kernel_size, activation=activation,
             data_format=data_format, padding=padding, *args, **kwargs)
-
 
 
 class PixelNorm(tf.keras.layers.Layer):
@@ -136,7 +129,6 @@ class Upscale2D(tf.keras.layers.Layer):
         x = tf.reshape(x, [-1, s[1], s[2] * self.factor, s[3] * self.factor])
         return x
 
-
 class ToRGB(WeightScaledConv2D):
     def __init__(self, num_channels: int = 3, *args, **kwargs):
         super().__init__(
@@ -170,126 +162,114 @@ class FirstGeneratorBlock(tf.keras.layers.Layer):
         x = self.pixelnorm(x)
         x = self.conv(x)
         x = self.pixelnorm(x)
+        #TODO: Does the first block need an image output?
+        # self.image_out = self.to_rbg(x)
         return x
-
+ 
+    def compute_output_shape(self, input_shape: tf.TensorShape) -> tf.TensorShape:
+        return tf.TensorShape([input_shape[0].value, 512, 4, 4])
 
 class GeneratorBlock(tf.keras.layers.Layer):
     def __init__(self, res: int, *args, **kwargs):
         self.res = res
         self.upscale2d = Upscale2D()
+        self.filters = nf(self.res-1)
         self.conv0 = WeightScaledConv2D(
-            filters=nf(self.res-1),
+            filters=self.filters,
             kernel_size=3,
         )
         self.conv1 = WeightScaledConv2D(
-            filters=nf(self.res-1),
+            filters=self.filters,
             kernel_size=3,
         )
         self.pixelnorm = PixelNorm()
+        self.to_rgb = ToRGB()
         super().__init__(*args, **kwargs)
 
-    def call(self, inputs: tf.Tensor):
+    def call(self, inputs: tf.Tensor) -> tf.Tensor:
         x = self.upscale2d(inputs)
         x = self.conv0(x)
         x = self.pixelnorm(x)
         x = self.conv1(x)
         x = self.pixelnorm(x)
+        self.image_out = self.to_rgb(x)
         return x
+    
+    def compute_output_shape(self, input_shape: tf.TensorShape) -> tf.TensorShape:
+        return tf.TensorShape([input_shape[0], self.filters, 2**self.res, 2**self.res])
 
 
-class LastGeneratorBlock(tf.keras.layers.Layer):
-    def __init__(self, res: int, growing_factor: tf.Tensor):
-        self.res = res
-        self.growing_factor = growing_factor
+class Generator(tf.keras.Sequential):
+    def __init__(self, resolution: int, growing_factor: tf.Tensor, latent_dims=128, *args, **kwargs) -> tf.keras.models.Sequential:
         super().__init__()
+        self.resolution_log2 = int(np.log2(resolution))
+        assert resolution == 2**self.resolution_log2 and resolution >= 4
+        
+        self.growing_factor = growing_factor
 
-        self.to_rgb_1 = ToRGB()
-        self.upscale2d = Upscale2D()
+        # provide static typing for the layers property.
+        self.layers: List[GeneratorBlock]
 
-        self.block = GeneratorBlock(self.res)
-        self.to_rgb_2 = ToRGB()
-
-    def call(self, inputs: tf.Tensor):
-        previous_image = self.to_rgb_1(inputs)
-        previous_image_upscaled = self.upscale2d(previous_image)
-
-        x = self.block(inputs)
-        image = self.to_rgb_2(x)
-
-        # Next line is equivalent to: mix = g * upscaled + (1-g) * x
-        mix = previous_image_upscaled + self.growing_factor * \
-            (image - previous_image_upscaled)
-        return mix
-
-
-class Generator(tf.keras.models.Sequential):
-    def __init__(self, resolution: int, growing_factor: tf.Tensor, latent_dims=128, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        resolution_log2 = int(np.log2(resolution))
-        assert resolution == 2**resolution_log2 and resolution >= 4
-
-        self.add(tf.keras.layers.InputLayer([latent_dims], dtype=tf.float32))
-
+        # self.latents = tf.keras.layers.InputLayer([latent_dims], dtype=tf.float32)
+        # self.add(self.latents)
         self.add(FirstGeneratorBlock())
-
-        for res in range(3,  resolution_log2):
+        for res in range(3,  self.resolution_log2+1):
             print(f"Adding a generator block for {2**res}x{2**res}")
             self.add(GeneratorBlock(res, name=f"gen_{2**res}x{2**res}"))
 
-        # last layer
-        self.add(
-            LastGeneratorBlock(
-                resolution_log2,
-                growing_factor=growing_factor
-            )
-        )
+    def call(self, inputs: tf.Tensor, training=False) -> tf.Tensor:
+        _ = super().call(inputs, training)
+        old = self.layers[-2].image_out
+        old_upscaled = Upscale2D()(old)
+        new = self.layers[-1].image_out
+        # Next line is equivalent to: mix = g * upscaled + (1-g) * x
+        x = old_upscaled + self.growing_factor * (new - old_upscaled)
+        x = tf.identity(x, name="image_out")
+        return x
 
+    @property
+    def output_resolution(self) -> Tuple[int, int]:
+        res = self.resolution_log2 ** 2
+        return (res, res)
 
-def nf(stage,
-       # Overall multiplier for the number of feature maps.
-       fmap_base=8192,
-       # log2 feature map reduction when doubling the resolution.
-       fmap_decay=1.0,
-       fmap_max=512,          # Maximum number of feature maps in any layer.
-       ):
+    def grow(self) -> None:
+        """Grows the network, doubling the output resolution.
+        """
+        self.resolution_log2 += 1
+        self.add(GeneratorBlock(self.resolution_log2))
+        
+def nf(stage, fmap_base=8192, fmap_decay=1.0, fmap_max=512):
+    """Gives the number of feature maps that is reasonable for a given stage.
+    Arguments:
+        fmap_base: Overall multiplier for the number of feature maps.        
+        fmap_decay: log2 feature map reduction when doubling the resolution.        
+        fmap_max: Maximum number of feature maps in any layer.
+    """
     return min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
 
 
-# Building blocks.
-resolution = 64
-latents_dims = 128
-print(nf(2))
 # img = tf.random_normal([3, 3, 64, 64])
 x = tf.random_normal([10, 128])
-# f1 = PixelNorm()
 
-# TODO: find the right way of integrating the growing factor.
-growing_factor = 0.5
-growing_factor = tf.placeholder(
-    tf.float32,
-    [1],
-    "growing_factor",
-)
+# growing_factor = [0.5]
+# growing_factor = tf.placeholder_with_default(growing_factor,
+    # [1],
+    # "growing_factor",
+# )
 
-g1 = Generator(64, growing_factor)
-
-for layer in g1.layers:
-    print(layer.input_shape, layer.output_shape)
-
-g2 = Generator(128, growing_factor)
-
+g1 = Generator(64, growing_factor=0)
 y1 = g1(x)
-y2 = g2(x)
+print(g1.summary())
+print(g1.get_config())
+print(y1)
+# for layer in g1.layers:
+#     print(layer.input_shape, layer.output_shape)
 
-with tf.Session() as sess:
-    sess.run(tf.global_variables_initializer())
-    # y_old = sess.run(y1, feed_dict={growing_factor: [1]})
-    # y_new = sess.run(y2, feed_dict={growing_factor: [0.]})
-
-# TODO: Idea: use the intuitive keras methods to transfer the weights.
-for i, (layer_old, layer_new) in enumerate(zip(g1.layers, g2.layers)):
-    print(i, layer_old.name, layer_new.name)
-    layer_new.set_weights(layer_old.get_weights())
-
+# with tf.Session() as sess:
+#     sess.run(tf.global_variables_initializer())
+#     y = sess.run(y1)
+#     print(y)
+#     print(g1.summary())
+#     y_old = sess.run(y1, feed_dict={growing_factor: [1]})
+  
 # TODO: create the discriminator model, the losses, and the training loop.
