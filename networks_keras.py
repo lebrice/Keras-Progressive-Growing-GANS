@@ -4,8 +4,7 @@ from functools import wraps
 import numpy as np
 import tensorflow as tf
 # tf.enable_eager_execution()
-
-
+import os
 
 class HeInitializer(tf.keras.initializers.VarianceScaling):
     """Simple Class-implementation of the He Normal Initializer"""
@@ -71,24 +70,33 @@ def WeightScaled(
 
 class WeightScaledDense(WeightScaled(tf.keras.layers.Dense)):
     def __init__(self,
-        units: int,
-        activation=tf.nn.leaky_relu,
-        use_bias=True,
-        *args, **kwargs):
-        super().__init__(units=units, activation=activation, use_bias=use_bias, *args, **kwargs)
+                 units: int,
+                 activation=tf.nn.leaky_relu,
+                 use_bias=True,
+                 *args, **kwargs):
+        super().__init__(units=units, activation=activation,
+                         use_bias=use_bias, *args, **kwargs)
+
 
 class WeightScaledConv2D(WeightScaled(tf.keras.layers.Conv2D)):
     def __init__(self,
                  filters: int,
                  kernel_size: int,
                  activation=tf.nn.leaky_relu,
+                 strides=(1, 1),
                  data_format="channels_first",
                  padding="SAME",
                  use_bias=True,
                  *args, **kwargs):
         super().__init__(
             filters=filters, kernel_size=kernel_size, activation=activation,
-            data_format=data_format, padding=padding, *args, **kwargs)
+            strides=strides, data_format=data_format, padding=padding, *args, **kwargs)
+
+
+class Conv2DDownscale2D(WeightScaledConv2D):
+    def __init__(self, filters: int, kernel_size: int, strides=2, *args, **kwargs):
+        super().__init__(filters=filters, kernel_size=kernel_size,
+                         strides=strides, *args, **kwargs)
 
 
 class PixelNorm(tf.keras.layers.Layer):
@@ -99,19 +107,8 @@ class PixelNorm(tf.keras.layers.Layer):
     def call(self, x: tf.Tensor) -> tf.Tensor:
         return x * tf.rsqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True) + self.epsilon)
 
-# ----------------------------------------------------------------------------
-# Fused conv2d + downscale2d.
-# Faster and uses less memory than performing the operations separately.
-
-
-# def conv2d_downscale2d(x, fmaps, kernel, gain=np.sqrt(2), use_wscale=False):
-#     assert kernel >= 1 and kernel % 2 == 1
-#     w = get_weight([kernel, kernel, x.shape[1].value, fmaps],
-#                    gain=gain, use_wscale=use_wscale)
-#     w = tf.pad(w, [[1, 1], [1, 1], [0, 0], [0, 0]], mode='CONSTANT')
-#     w = tf.add_n([w[1:, 1:], w[:-1, 1:], w[1:, :-1], w[:-1, :-1]]) * 0.25
-#     w = tf.cast(w, x.dtype)
-#     return tf.nn.conv2d(x, w, strides=[1, 1, 2, 2], padding='SAME', data_format='NCHW')
+    def compute_output_shape(self, input_shape: tf.TensorShape) -> tf.TensorShape:
+        return input_shape
 
 
 class Upscale2D(tf.keras.layers.Layer):
@@ -128,6 +125,33 @@ class Upscale2D(tf.keras.layers.Layer):
         x = tf.tile(x, [1, 1, 1, self.factor, 1, self.factor])
         x = tf.reshape(x, [-1, s[1], s[2] * self.factor, s[3] * self.factor])
         return x
+
+    def compute_output_shape(self, input_shape: tf.TensorShape) -> tf.TensorShape:
+        return tf.TensorShape([*input_shape[:-2], *(d.value * 2 for d in input_shape[-2:])])
+
+
+class Upscale2DConv2D(WeightScaled(tf.keras.layers.Conv2DTranspose)):
+    def __init__(
+        self,
+        filters: int,
+        kernel_size: int,
+        strides=2,
+        activation=tf.nn.leaky_relu,
+        padding="SAME",
+        data_format="channels_first",
+        *args,
+        **kwargs,
+    ):
+        super().__init__(
+            filters=filters,
+            kernel_size=kernel_size,
+            strides=strides,
+            activation=activation,
+            padding=padding,
+            data_format=data_format,
+            *args,
+            **kwargs,
+        )
 
 class ToRGB(WeightScaledConv2D):
     def __init__(self, num_channels: int = 3, *args, **kwargs):
@@ -162,19 +186,19 @@ class FirstGeneratorBlock(tf.keras.layers.Layer):
         x = self.pixelnorm(x)
         x = self.conv(x)
         x = self.pixelnorm(x)
-        #TODO: Does the first block need an image output?
+        # TODO: Does the first block need an image output?
         # self.image_out = self.to_rbg(x)
         return x
- 
+
     def compute_output_shape(self, input_shape: tf.TensorShape) -> tf.TensorShape:
         return tf.TensorShape([input_shape[0].value, 512, 4, 4])
+
 
 class GeneratorBlock(tf.keras.layers.Layer):
     def __init__(self, res: int, *args, **kwargs):
         self.res = res
-        self.upscale2d = Upscale2D()
         self.filters = nf(self.res-1)
-        self.conv0 = WeightScaledConv2D(
+        self.upscale_conv = Upscale2DConv2D(
             filters=self.filters,
             kernel_size=3,
         )
@@ -182,21 +206,31 @@ class GeneratorBlock(tf.keras.layers.Layer):
             filters=self.filters,
             kernel_size=3,
         )
-        self.pixelnorm = PixelNorm()
         self.to_rgb = ToRGB()
         super().__init__(*args, **kwargs)
 
     def call(self, inputs: tf.Tensor) -> tf.Tensor:
-        x = self.upscale2d(inputs)
-        x = self.conv0(x)
-        x = self.pixelnorm(x)
+        # x = self.upscale2d(inputs)
+        # x = self.conv0(x)
+        x = self.upscale_conv(inputs)
+        x = PixelNorm()(x)
         x = self.conv1(x)
-        x = self.pixelnorm(x)
+        x = PixelNorm()(x)
         self.image_out = self.to_rgb(x)
         return x
-    
+
     def compute_output_shape(self, input_shape: tf.TensorShape) -> tf.TensorShape:
         return tf.TensorShape([input_shape[0], self.filters, 2**self.res, 2**self.res])
+
+def generator_block(res: int) -> List[tf.keras.layers.Layer]:
+    prefix = f"{2**res}x{2**res}"
+    filters = nf(res-1)
+    return [
+        Upscale2DConv2D(filters=filters,kernel_size=3,name=prefix),
+        PixelNorm(name=prefix),
+        WeightScaledConv2D(filters=filters,kernel_size=3, name=prefix),
+        PixelNorm(name=prefix),
+    ]
 
 
 class Generator(tf.keras.Sequential):
@@ -204,18 +238,22 @@ class Generator(tf.keras.Sequential):
         super().__init__()
         self.resolution_log2 = int(np.log2(resolution))
         assert resolution == 2**self.resolution_log2 and resolution >= 4
-        
+
         self.growing_factor = growing_factor
 
         # provide static typing for the layers property.
         self.layers: List[GeneratorBlock]
-
         # self.latents = tf.keras.layers.InputLayer([latent_dims], dtype=tf.float32)
         # self.add(self.latents)
         self.add(FirstGeneratorBlock())
         for res in range(3,  self.resolution_log2+1):
-            print(f"Adding a generator block for {2**res}x{2**res}")
-            self.add(GeneratorBlock(res, name=f"gen_{2**res}x{2**res}"))
+            suffix = f"{2**res}x{2**res}"
+            # filters = nf(res-1)
+            # self.add(Upscale2DConv2D(filters=filters, kernel_size=3))
+            # self.add(PixelNorm())
+            # self.add(WeightScaledConv2D(filters=filters, kernel_size=3))
+            # self.add(PixelNorm(name=f"features_{2**res}x{2**res}"))
+            self.add(GeneratorBlock(res, name=f"gen_{suffix}"))
 
     def call(self, inputs: tf.Tensor, training=False) -> tf.Tensor:
         _ = super().call(inputs, training)
@@ -237,7 +275,8 @@ class Generator(tf.keras.Sequential):
         """
         self.resolution_log2 += 1
         self.add(GeneratorBlock(self.resolution_log2))
-        
+
+
 def nf(stage, fmap_base=8192, fmap_decay=1.0, fmap_max=512):
     """Gives the number of feature maps that is reasonable for a given stage.
     Arguments:
@@ -248,28 +287,13 @@ def nf(stage, fmap_base=8192, fmap_decay=1.0, fmap_max=512):
     return min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
 
 
-# img = tf.random_normal([3, 3, 64, 64])
-x = tf.random_normal([10, 128])
-
-# growing_factor = [0.5]
-# growing_factor = tf.placeholder_with_default(growing_factor,
-    # [1],
-    # "growing_factor",
-# )
-
-g1 = Generator(64, growing_factor=0)
-y1 = g1(x)
-print(g1.summary())
-print(g1.get_config())
-print(y1)
-# for layer in g1.layers:
-#     print(layer.input_shape, layer.output_shape)
-
-# with tf.Session() as sess:
-#     sess.run(tf.global_variables_initializer())
-#     y = sess.run(y1)
-#     print(y)
-#     print(g1.summary())
-#     y_old = sess.run(y1, feed_dict={growing_factor: [1]})
-  
-# TODO: create the discriminator model, the losses, and the training loop.
+def test_discriminator(resolution: int):
+    model = tf.keras.Sequential()
+    model.add(tf.keras.layers.InputLayer([3,resolution,resolution], dtype=tf.float32))
+    model.add(tf.keras.layers.Conv2D(64, 3, data_format="channels_first"))
+    model.add(tf.keras.layers.Conv2D(64, 3, data_format="channels_first", strides=2))
+    model.add(tf.keras.layers.Conv2D(64, 3, data_format="channels_first", strides=2))
+    model.add(tf.keras.layers.Conv2D(64, 3, data_format="channels_first", strides=2))
+    model.add(tf.keras.layers.Flatten())
+    model.add(tf.keras.layers.Dense(1))
+    return model
