@@ -16,12 +16,11 @@ def normalize_images(images: tf.Tensor) -> tf.Tensor:
 def unnormalize_images(images: tf.Tensor) -> tf.Tensor:
     return tf.cast(images * 127.5 + 127.5, tf.uint8)
 
-
-def log2(resolution: int) -> int:
-    res_log2 = int(np.log2(resolution))
-    if 2**res_log2 != resolution:
-        raise RuntimeError(f"Resolution {resolution} is not a power of two.")
-    return res_log2
+def log2(x: int) -> int:
+    x_log2 = int(np.log2(x))
+    if 2**x_log2 != x:
+        raise RuntimeError(f"Resolution {x} is not a power of two.")
+    return x_log2
 
 
 class HeInitializer(tf.keras.initializers.VarianceScaling):

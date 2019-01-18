@@ -29,8 +29,39 @@ def discriminator_loss(real_output, generated_output):
 
 
 
+cifar10 = tf.keras.datasets.cifar10
+(train_images, _), (test_images, _) = cifar10.load_data()
 
-EPOCHS = 50
+train_images = normalize_images(train_images)
+train_images = NHWC_to_NCHW(train_images)
+
+test_images = normalize_images(test_images)
+test_images = NHWC_to_NCHW(test_images)
+
+BATCH_SIZE = 32
+BUFFER_SIZE = 1000
+
+train_dataset = (tf.data.Dataset.from_tensor_slices(train_images)
+                 .shuffle(BUFFER_SIZE)
+                 .batch(BATCH_SIZE))
+
+
+resolution = 32
+
+
+generator = Generator(resolution, growing_factor=0)
+discriminator = Discriminator(resolution)
+
+generator_optimizer = tf.train.AdamOptimizer(1e-4)
+discriminator_optimizer = tf.train.AdamOptimizer(1e-4)
+
+checkpoint_dir = './training_checkpoints'
+checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+checkpoint = tf.train.Checkpoint(generator_optimizer=generator_optimizer,
+                                 discriminator_optimizer=discriminator_optimizer,
+                                 generator=generator,
+                                 discriminator=discriminator)
+
 
 @tf.contrib.eager.defun
 def train_step(images):
@@ -55,8 +86,8 @@ def train_step(images):
     discriminator_optimizer.apply_gradients(
         zip(gradients_of_discriminator, discriminator.variables))
 
-
-
+    discriminator.summary()
+    exit()
 noise_dim = 128
 num_examples_to_generate = 16
 
@@ -105,39 +136,5 @@ def generate_and_save_images(model, epoch, test_input):
     plt.savefig('image_at_epoch_{:04d}.png'.format(epoch))
     plt.show()
 
-
-
-cifar10 = tf.keras.datasets.cifar10
-(train_images, _), (test_images, _) = cifar10.load_data()
-
-train_images = normalize_images(train_images)
-train_images = NHWC_to_NCHW(train_images)
-
-test_images = normalize_images(test_images)
-test_images = NHWC_to_NCHW(test_images)
-
-BATCH_SIZE = 32
-BUFFER_SIZE = 1000
-
-train_dataset = (tf.data.Dataset.from_tensor_slices(train_images)
-                 .shuffle(BUFFER_SIZE)
-                 .batch(BATCH_SIZE))
-
-
-resolution = 32
-
-
-generator = Generator(resolution, growing_factor=0)
-discriminator = test_discriminator(resolution)
-
-generator_optimizer = tf.train.AdamOptimizer(1e-4)
-discriminator_optimizer = tf.train.AdamOptimizer(1e-4)
-
-checkpoint_dir = './training_checkpoints'
-checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
-checkpoint = tf.train.Checkpoint(generator_optimizer=generator_optimizer,
-                                 discriminator_optimizer=discriminator_optimizer,
-                                 generator=generator,
-                                 discriminator=discriminator)
-
+EPOCHS = 50
 train_eager(train_dataset, EPOCHS)

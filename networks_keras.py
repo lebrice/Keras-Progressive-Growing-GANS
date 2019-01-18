@@ -7,6 +7,7 @@ import os
 from utils import log2, HeInitializer
 
 tf.enable_eager_execution()
+
 def WeightScaled(
         layer_base_class: Type[tf.keras.layers.Layer],
         kernel_attr: str = "kernel",
@@ -135,40 +136,113 @@ class ToRGB(WeightScaledConv2D):
             gain=1,
             filters=num_channels,
             kernel_size=1,
+            activation=tf.keras.activations.linear,
             *args,
             **kwargs,
         )
 
 
-class FirstGeneratorBlock(tf.keras.layers.Layer):
-    def __init__(self, normalize_latents: bool = True, pixelnorm_epsilon=1e-8, *args, **kwargs):
-        self.normalize_latents = normalize_latents
-        self.pixelnorm = PixelNorm(pixelnorm_epsilon)
-        self.dense = WeightScaledDense(
-            units=512 * 4 * 4,
-        )
-        self.reshape = tf.keras.layers.Reshape([512, 4, 4])
-        self.conv = WeightScaledConv2D(
-            filters=512,
-            kernel_size=3,
-        )
-        self.to_rgb = ToRGB()
-        super().__init__(*args, **kwargs)
+class FromRGB(WeightScaledConv2D):
+    def __init__(self, filters: int, *args, **kwargs):
+        super().__init__(filters=filters, kernel_size=1, *args, **kwargs)
 
-    def call(self, x: tf.Tensor):
-        if self.normalize_latents:
-            x = self.pixelnorm(x)
-        x = self.dense(x)
-        x = self.reshape(x)
-        x = self.pixelnorm(x)
-        x = self.conv(x)
-        x = self.pixelnorm(x)
-        # TODO: Does the first block need an image output?
-        self.image_out = self.to_rgb(x)
-        return x
+
+class MinibatchStdDevLayer(tf.keras.layers.Layer):
+    def __init__(self, group_size=4, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.group_size = group_size
+
+    def call(self, x: tf.Tensor) -> tf.Tensor:
+        # Minibatch must be divisible by (or smaller than) group_size.
+        group_size = tf.minimum(self.group_size, tf.shape(x)[0])
+        # [NCHW]  Input shape.
+        s = x.shape
+        # [GMCHW] Split minibatch into M groups of size G.
+        y = tf.reshape(x, [group_size, -1, s[1], s[2], s[3]])
+        # [GMCHW] Cast to FP32.
+        y = tf.cast(y, tf.float32)
+        # [GMCHW] Subtract mean over group.
+        y -= tf.reduce_mean(y, axis=0, keepdims=True)
+        # [MCHW]  Calc variance over group.
+        y = tf.reduce_mean(tf.square(y), axis=0)
+        # [MCHW]  Calc stddev over group.
+        y = tf.sqrt(y + 1e-8)
+        # [M111]  Take average over fmaps and pixels.
+        y = tf.reduce_mean(y, axis=[1, 2, 3], keepdims=True)
+        # [M111]  Cast back to original data type.
+        y = tf.cast(y, x.dtype)
+        # [N1HW]  Replicate over group and pixels.
+        y = tf.tile(y, [group_size, 1, s[2], s[3]])
+        # [NCHW]  Append as new fmap.
+        return tf.concat([x, y], axis=1)
 
     def compute_output_shape(self, input_shape: tf.TensorShape) -> tf.TensorShape:
-        return tf.TensorShape([input_shape[0].value, 512, 4, 4])
+        out = input_shape.as_list()
+        out[-3] += 1
+        return tf.TensorShape(out)
+
+
+# class FirstGeneratorBlock(tf.keras.layers.Layer):
+#     def __init__(self, normalize_latents: bool = True, pixelnorm_epsilon=1e-8, *args, **kwargs):
+#         self.normalize_latents = normalize_latents
+#         self.pixelnorm = PixelNorm(pixelnorm_epsilon)
+#         self.dense = WeightScaledDense(
+#             units=512 * 4 * 4,
+#         )
+#         self.reshape = tf.keras.layers.Reshape([512, 4, 4])
+#         self.conv = WeightScaledConv2D(
+#             filters=512,
+#             kernel_size=3,
+#         )
+#         self.to_rgb = ToRGB()
+#         super().__init__(*args, **kwargs)
+
+#     def call(self, x: tf.Tensor):
+#         if self.normalize_latents:
+#             x = self.pixelnorm(x)
+#         x = self.dense(x)
+#         x = self.reshape(x)
+#         x = self.pixelnorm(x)
+#         x = self.conv(x)
+#         x = self.pixelnorm(x)
+#         # TODO: Does the first block need an image output?
+#         self.image_out = self.to_rgb(x)
+#         return x
+
+#     def compute_output_shape(self, input_shape: tf.TensorShape) -> tf.TensorShape:
+#         return tf.TensorShape([input_shape[0].value, 512, 4, 4])
+
+
+
+# class GeneratorBlock(tf.keras.layers.Layer):
+#     def __init__(self, res_log2: int, *args, **kwargs):
+#         self.res_log2 = res_log2
+#         self.filters = num_filters(self.res_log2-1)
+#         if "name" not in kwargs:
+#             kwargs["name"] = f"generator_block_{2**res_log2}x{2**res_log2}"
+#         self.upscale_conv = Upscale2DConv2D(
+#             filters=self.filters,
+#             kernel_size=3,
+#         )
+#         self.conv1 = WeightScaledConv2D(
+#             filters=self.filters,
+#             kernel_size=3,
+#         )
+#         self.to_rgb = ToRGB()
+#         super().__init__(*args, **kwargs)
+
+#     def call(self, inputs: tf.Tensor) -> tf.Tensor:
+#         # x = self.upscale2d(inputs)
+#         # x = self.conv0(x)
+#         x = self.upscale_conv(inputs)
+#         x = PixelNorm()(x)
+#         x = self.conv1(x)
+#         x = PixelNorm()(x)
+#         self.image_out = self.to_rgb(x)
+#         return x
+
+#     def compute_output_shape(self, input_shape: tf.TensorShape) -> tf.TensorShape:
+#         return tf.TensorShape([input_shape[0], self.filters, 2**self.res_log2, 2**self.res_log2])
 
 
 def first_generator_block() -> List[tf.keras.layers.Layer]:
@@ -180,37 +254,6 @@ def first_generator_block() -> List[tf.keras.layers.Layer]:
         WeightScaledConv2D(filters=512, kernel_size=3, name="gen_4x4_conv2d"),
         PixelNorm(name="gen_4x4_output"),
     ]
-
-
-class GeneratorBlock(tf.keras.layers.Layer):
-    def __init__(self, res_log2: int, *args, **kwargs):
-        self.res_log2 = res_log2
-        self.filters = num_filters(self.res_log2-1)
-        if "name" not in kwargs:
-            kwargs["name"] = f"generator_block_{2**res_log2}x{2**res_log2}"
-        self.upscale_conv = Upscale2DConv2D(
-            filters=self.filters,
-            kernel_size=3,
-        )
-        self.conv1 = WeightScaledConv2D(
-            filters=self.filters,
-            kernel_size=3,
-        )
-        self.to_rgb = ToRGB()
-        super().__init__(*args, **kwargs)
-
-    def call(self, inputs: tf.Tensor) -> tf.Tensor:
-        # x = self.upscale2d(inputs)
-        # x = self.conv0(x)
-        x = self.upscale_conv(inputs)
-        x = PixelNorm()(x)
-        x = self.conv1(x)
-        x = PixelNorm()(x)
-        self.image_out = self.to_rgb(x)
-        return x
-
-    def compute_output_shape(self, input_shape: tf.TensorShape) -> tf.TensorShape:
-        return tf.TensorShape([input_shape[0], self.filters, 2**self.res_log2, 2**self.res_log2])
 
 
 def generator_block(res: int) -> List[tf.keras.layers.Layer]:
@@ -226,32 +269,8 @@ def generator_block(res: int) -> List[tf.keras.layers.Layer]:
     ]
 
 
-def make_generator(output_resolution: int, latent_dims=128, growing_factor=0.0) -> tf.keras.Model:
-    res_log2 = log2(output_resolution)
-
-    blocks = []
-    latents = tf.keras.Input([latent_dims])
-    x = latents
-    blocks = [FirstGeneratorBlock()] + [GeneratorBlock(res)
-                                        for res in range(3, res_log2+1)]
-    # print(blocks)
-
-    for block in blocks:
-        x = block(x)
-    images = [block.image_out for block in blocks]
-
-    old = images[-2]
-    new = images[-1]
-
-    old_upscaled = Upscale2D()(old)
-
-    mix = new + growing_factor * (old_upscaled - new)
-    # output = tf.identity(mix, "image_out")
-    return mix
-
-
 class Generator(tf.keras.Sequential):
-    def __init__(self, image_resolution: int=4, latent_dims=128, growing_factor: tf.Tensor = 0.0):
+    def __init__(self, image_resolution: int = 4, latent_dims=128, growing_factor: tf.Tensor = 0.0):
         super().__init__()
         self.res_log2 = log2(image_resolution)
         self.growing_factor = growing_factor
@@ -264,6 +283,7 @@ class Generator(tf.keras.Sequential):
                 self.add(layer)
         self.upscale = Upscale2D()
         self.images = []
+        # self.image_layers = []
 
     @property
     def stage(self) -> int:
@@ -275,27 +295,38 @@ class Generator(tf.keras.Sequential):
             x = layer(x)
             if "_output" in layer.name and not hasattr(self, layer.name + "_image"):
                 image_layer = ToRGB()
+                # self.image_layers.append(image_layer)
                 setattr(self, layer.name + "_image", image_layer)
                 self.images.append(image_layer(x))
-        print(self.images)
+
         new = self.images[-1]
         if (self.stage == 1):
-            return new
             # we haven't started growing the network yet
-        # print(self.images)
+            return new
+
         old = self.images[-2]
-
         old_upscaled = self.upscale(old)
-        mix = old_upscaled * (1 - self.growing_factor) + new * self.growing_factor
+        mix = (
+            (1 - self.growing_factor) * old_upscaled + 
+            self.growing_factor * new
+        )
         return mix
-
 
     def grow(self) -> None:
         """Grows the generator, adding in another stage and doubling the output resolution."""
         self.growing_factor = 0
         self.res_log2 += 1
-        for layer in generator_block(self.res_log2):
-            self.add(layer)
+        prefix = f"{2**self.res_log2}x{2**self.res_log2}"
+        filters = num_filters(self.res_log2-1)
+
+        self.add(Upscale2DConv2D(filters=filters, kernel_size=3,name=f"{prefix}_upscale"))
+        self.add(PixelNorm(name=f"{prefix}_pixelnorm"))
+        self.add(WeightScaledConv2D(filters=filters, kernel_size=3,name=f"{prefix}_conv2d"))
+        self.add(PixelNorm(name=f"{prefix}_output"))
+
+        # for layer in generator_block(self.res_log2):
+            # self.add(layer)
+
 
 def num_filters(stage, fmap_base=8192, fmap_decay=1.0, fmap_max=512):
     """Gives the number of feature maps that is reasonable for a given stage.
@@ -305,22 +336,6 @@ def num_filters(stage, fmap_base=8192, fmap_decay=1.0, fmap_max=512):
         fmap_max: Maximum number of feature maps in any layer.
     """
     return min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
-
-
-def test_discriminator(resolution: int):
-    model = tf.keras.Sequential()
-    model.add(tf.keras.layers.InputLayer(
-        [3, resolution, resolution], dtype=tf.float32))
-    model.add(tf.keras.layers.Conv2D(64, 3, data_format="channels_first"))
-    model.add(tf.keras.layers.Conv2D(
-        64, 3, data_format="channels_first", strides=2))
-    model.add(tf.keras.layers.Conv2D(
-        64, 3, data_format="channels_first", strides=2))
-    model.add(tf.keras.layers.Conv2D(
-        64, 3, data_format="channels_first", strides=2))
-    model.add(tf.keras.layers.Flatten())
-    model.add(tf.keras.layers.Dense(1))
-    return model
 
 
 
@@ -342,3 +357,104 @@ def test_discriminator(resolution: int):
 # for _ in range(10):
 #     gen.growing_factor += 0.05
 #     show_image(gen)
+
+
+
+class DiscriminatorBlock(tf.keras.models.Sequential):
+    def __init__(self, resolution: int, kernel_size=3, *args, **kwargs):
+        if "name" not in kwargs:
+            kwargs["name"] = f"disc_block_{resolution}x{resolution}" 
+        super().__init__(*args, **kwargs)
+        self.stage = stage_of_resolution(resolution)
+        self.is_first_block: bool
+        self.mixing_factor: float = 0.0
+
+    def build(self, input_shape: tf.TensorShape):
+        # We received the image as input. We are the first block.
+        self.is_first_block = input_shape[-3].value == 3
+        if self.is_first_block:
+            self.add(FromRGB(num_filters(self.stage), name=f"disc_{self.stage}_from_rgb"))
+        self.add(WeightScaledConv2D(filters=num_filters(self.stage), kernel_size=3, name=f"disc_{self.stage}_conv0"))
+        self.add(WeightScaledConv2D(filters=num_filters(self.stage+1), kernel_size=3, name=f"disc_{self.stage}_conv1"))
+        self.add(tf.keras.layers.AveragePooling2D(data_format="channels_first", name=f"disc_{self.stage}_avg_pooling"))
+        super().build(input_shape)
+
+    def call(self, inputs: tf.Tensor, training=False) -> tf.Tensor:
+        if self.is_first_block:
+            print("TODO: First block of the discriminator isn't implemented yet.")
+            exit()
+        else:
+            return super().call(inputs, training)
+
+
+class Discriminator(tf.keras.models.Sequential):
+    def __init__(self, *args, **kwargs):
+        self.resolution: int
+        super().__init__(*args, **kwargs)
+        self.built = False
+
+    def build(self, input_shape: tf.TensorShape):
+        self.resolution = input_shape[-1].value
+        self.stage = stage_of_resolution(self.resolution)
+
+        self.add(tf.keras.layers.InputLayer([3, self.resolution, self.resolution]))
+        self.add(FromRGB(filters_for(self.resolution), name="from_rgb"))       
+        for i in range(self.stage, 0, -1):
+            if i == 0:
+                pass
+            self.add(DiscriminatorBlock(resolution_of_stage(i)))   
+
+        self.add(MinibatchStdDevLayer())
+        self.add(WeightScaledConv2D(filters=num_filters(1), kernel_size=3, name="conv0"))
+        self.add(WeightScaledConv2D(filters=num_filters(1), kernel_size=4, padding="valid", name="conv1"))
+        self.add(tf.keras.layers.Flatten())
+        self.add(WeightScaledDense(units=1, gain=1, activation=tf.keras.activations.linear, name="dense0"))
+        super().build(input_shape)
+
+    def call(self, inputs: tf.Tensor, training=False) -> tf.Tensor:
+        print("call was called.")
+        return super().call(inputs, training)
+    
+    def grow(self) -> None:
+        """Adds a layer at the front of the discriminator."""
+        pass
+        # current_layers = [l for l in self.layers]
+
+def stage_of_resolution(res: int) -> int:
+    """Measure of the stage of growth of the model.
+    Also corresponds to the number of intermediate discriminator blocks. 
+    Stage 0: 4x4 resolution
+    Stage 1: 8x8 input resolution, etc.
+    """
+    return log2(res) - 2
+
+def resolution_of_stage(stage: int) -> int:
+    return 2 ** (stage+2)
+
+def filters_for(resolution) -> int:
+    res_log2 = log2(resolution)
+    return num_filters(res_log2-1)
+
+# x = tf.random_normal([1, 3, 4, 4])
+# disc_1 = Discriminator()
+# y = disc_1(x)
+# disc_1.summary()
+# print(y.shape)
+
+# # trained_weights = discriminator.get_weights()
+# # trained_config = discriminator.get_config()
+# # print(trained_config)
+# # discriminator2 = Discriminator.from_config(discriminator.get_config(), custom_objects={
+# #     "FromRGB": FromRGB
+# # })
+
+# x2 = tf.random_normal([1, 3, 1024, 1024])
+# disc_2 = Discriminator()
+# disc_2.set_weights(disc_1.get_weights)
+# y2 = disc_2(x2)
+# disc_2.summary()
+# print(y2.shape)
+# discriminator2.summary()
+# print(discriminator.compute_output_shape(x.shape))
+# discriminator.summary()
+# discriminator.layers[1].summary()
