@@ -1,15 +1,24 @@
-
+"""
+Training script.
+Taken in big part from this DCGAN tutorial:
+https://colab.research.google.com/github/tensorflow/tensorflow/blob/master/tensorflow/contrib/eager/python/examples/generative_examples/dcgan.ipynb
+"""
 import time
 import matplotlib.pyplot as plt
 import tensorflow as tf
-tf.enable_eager_execution()
+# tf.enable_eager_execution()
 
 from itertools import islice
 from progressbar import progressbar
 
-from networks_keras import *
+
 from utils import NHWC_to_NCHW, normalize_images
 from math import ceil
+import os
+
+from networks_keras import Downscale2D
+from discriminator import Discriminator
+from generator import Generator
 
 def generator_loss(generated_output):
     return tf.losses.sigmoid_cross_entropy(tf.ones_like(generated_output), generated_output)
@@ -38,19 +47,34 @@ train_images = NHWC_to_NCHW(train_images)
 test_images = normalize_images(test_images)
 test_images = NHWC_to_NCHW(test_images)
 
+train_images_32x32 = train_images
+train_images_16x16 = Downscale2D()(train_images_32x32)
+train_images_8x8 = Downscale2D()(train_images_16x16)
+train_images_4x4 = Downscale2D()(train_images_8x8)
+
+test_images_32x32 = test_images
+test_images_16x16 = Downscale2D()(test_images_32x32)
+test_images_8x8 =   Downscale2D()(test_images_16x16)
+test_images_4x4 =   Downscale2D()(test_images_8x8)
+
 BATCH_SIZE = 32
 BUFFER_SIZE = 1000
 
-train_dataset = (tf.data.Dataset.from_tensor_slices(train_images)
+train_dataset_32x32 = (tf.data.Dataset.from_tensor_slices(train_images_32x32)
+                 .shuffle(BUFFER_SIZE)
+                 .batch(BATCH_SIZE))
+train_dataset_16x16 = (tf.data.Dataset.from_tensor_slices(train_images_16x16)
+                 .shuffle(BUFFER_SIZE)
+                 .batch(BATCH_SIZE))
+train_dataset_8x8 = (tf.data.Dataset.from_tensor_slices(train_images_8x8)
+                 .shuffle(BUFFER_SIZE)
+                 .batch(BATCH_SIZE))
+train_dataset_4x4 = (tf.data.Dataset.from_tensor_slices(train_images_4x4)
                  .shuffle(BUFFER_SIZE)
                  .batch(BATCH_SIZE))
 
-
-resolution = 32
-
-
-generator = Generator(resolution, growing_factor=0)
-discriminator = Discriminator(resolution)
+generator = Generator()
+discriminator = Discriminator()
 
 generator_optimizer = tf.train.AdamOptimizer(1e-4)
 discriminator_optimizer = tf.train.AdamOptimizer(1e-4)
@@ -70,7 +94,6 @@ def train_step(images):
     # print(images)
     with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
         generated_images = generator(noise, training=True)
-
         real_output = discriminator(images, training=True)
         generated_output = discriminator(generated_images, training=True)
 
@@ -86,9 +109,7 @@ def train_step(images):
     discriminator_optimizer.apply_gradients(
         zip(gradients_of_discriminator, discriminator.variables))
 
-    discriminator.summary()
-    exit()
-noise_dim = 128
+noise_dim = 512
 num_examples_to_generate = 16
 
 # We'll re-use this random vector used to seed the generator so
@@ -136,5 +157,11 @@ def generate_and_save_images(model, epoch, test_input):
     plt.savefig('image_at_epoch_{:04d}.png'.format(epoch))
     plt.show()
 
-EPOCHS = 50
-train_eager(train_dataset, EPOCHS)
+EPOCHS = 1
+train_eager(train_dataset_4x4, EPOCHS)
+generator.grow()
+train_eager(train_dataset_8x8, EPOCHS)
+generator.grow()
+train_eager(train_dataset_16x16, EPOCHS)
+generator.grow()
+train_eager(train_dataset_32x32, EPOCHS)
